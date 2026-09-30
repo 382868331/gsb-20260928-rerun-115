@@ -37,19 +37,19 @@ var Release = Drive{SCL: High, SDA: High}
 
 // Snapshot 是一次观测时刻总线的完整状态。
 type Snapshot struct {
-	Tick  int
-	Phase int // 一个位时钟内的四分之一相位 0..3
-	SCL   Level
-	SDA   Level
-	PrevSCL Level
-	PrevSDA Level
-	Drives map[string]Drive // 当刻所有设备的驱动意图
-	OwnersSCL []string      // 当前把 SCL 拉低的设备
+	Tick      int
+	Phase     int // 一个位时钟内的四分之一相位 0..3
+	SCL       Level
+	SDA       Level
+	PrevSCL   Level
+	PrevSDA   Level
+	Drives    map[string]Drive // 当刻所有设备的驱动意图
+	OwnersSCL []string         // 当前把 SCL 拉低的设备
 	OwnersSDA []string
 }
 
 // SCLRising / SCLFalling 等边沿判断，供设备在事件边界上推进状态机。
-func (s Snapshot) SCLRising() bool { return s.PrevSCL == Low && s.SCL == High }
+func (s Snapshot) SCLRising() bool  { return s.PrevSCL == Low && s.SCL == High }
 func (s Snapshot) SCLFalling() bool { return s.PrevSCL == High && s.SCL == Low }
 func (s Snapshot) SDAFalling() bool { return s.PrevSDA == High && s.SDA == Low }
 func (s Snapshot) SDARising() bool  { return s.PrevSDA == Low && s.SDA == High }
@@ -62,14 +62,15 @@ func (s Snapshot) StopCondition() bool { return s.SCL == High && s.SDARising() }
 
 // 事件种类。事件是协议无关的设备间通知机制。
 const (
-	EvStart       = "start"        // 观测到 START 条件
-	EvStop        = "stop"         // 观测到 STOP 条件，总线回到空闲
-	EvArbGrant    = "arb-grant"   // 仲裁有了唯一胜者
-	EvArbLost     = "arb-lost"    // 某主设备输掉仲裁，必须立刻释放总线
-	EvReset       = "reset"       // 中途复位
+	EvStart        = "start"     // 观测到 START 条件
+	EvStop         = "stop"      // 观测到 STOP 条件，总线回到空闲
+	EvArbGrant     = "arb-grant" // 仲裁有了唯一胜者
+	EvArbLost      = "arb-lost"  // 某主设备输掉仲裁，必须立刻释放总线
+	EvReset        = "reset"     // 中途复位
 	EvRecoverBegin = "recovery-begin"
 	EvRecoverClock = "recovery-clock"
 	EvRecoverDone  = "recovery-done"
+	EvRecoverFail  = "recovery-failed"
 )
 
 // Entry 是消息记录中的一条：要么记录一段电平，要么记录一个事件。
@@ -102,8 +103,8 @@ type Bus struct {
 	pendReg []Device
 	pendUn  []Device
 
-	drives map[string]Drive
-	scl, sda     Level
+	drives           map[string]Drive
+	scl, sda         Level
 	prevSCL, prevSDA Level
 
 	Trace []Entry
@@ -119,9 +120,20 @@ func New() *Bus {
 	}
 }
 
+// RunTicks 推进 n 个四分之一相位。
+func (b *Bus) RunTicks(n int) {
+	for i := 0; i < n; i++ {
+		b.Step()
+	}
+}
+
 // Register 在当前时钟结束后挂载设备（安全的增删时机）。
-func (b *Bus) Register(d Device) { b.pendReg = append(b.pendReg, d) }
+func (b *Bus) Register(d Device)   { b.pendReg = append(b.pendReg, d) }
 func (b *Bus) Unregister(d Device) { b.pendUn = append(b.pendUn, d) }
+
+// ApplyPending 立即处理挂起的挂载/卸载。运行开始前调用可保证所有设备
+// 从第一个 tick 起就参与电平求解，不会错过 START 拍。
+func (b *Bus) ApplyPending() { b.applyPending() }
 
 func (b *Bus) Devices() []Device { return b.devs }
 
@@ -133,9 +145,8 @@ func (b *Bus) Emit(kind, who, detail string) {
 	}
 }
 
-// Tick 推进一个四分之一位时钟：先求驱动，再线与，最后广播观测。
-func (b *Bus) Tick() {
-	b.Tick++
+// Step 推进一个四分之一位时钟：先求驱动，再线与，最后广播观测。
+func (b *Bus) Step() {
 	phase := b.Tick % 4
 
 	b.drives = make(map[string]Drive, len(b.devs))
@@ -161,7 +172,7 @@ func (b *Bus) Tick() {
 		Tick: b.Tick, Phase: phase,
 		SCL: b.scl, SDA: b.sda,
 		PrevSCL: b.prevSCL, PrevSDA: b.prevSDA,
-		Drives: b.drives,
+		Drives:    b.drives,
 		OwnersSCL: keysOf(ownerSCL), OwnersSDA: keysOf(ownerSDA),
 	}
 
@@ -182,6 +193,7 @@ func (b *Bus) Tick() {
 	}
 
 	b.applyPending()
+	b.Tick++
 }
 
 func (b *Bus) applyPending() {
@@ -203,7 +215,7 @@ func (b *Bus) Idle() bool { return b.scl == High && b.sda == High }
 
 func keysOf(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
-	k := range m {
+	for k := range m {
 		out = append(out, k)
 	}
 	sort.Strings(out)
@@ -212,7 +224,11 @@ func keysOf(m map[string]bool) []string {
 
 func mergeOwners(a, b []string) []string {
 	m := map[string]bool{}
-	for _, x := range a { m[x] = true }
-	for _, x := range b { m[x] = true }
+	for _, x := range a {
+		m[x] = true
+	}
+	for _, x := range b {
+		m[x] = true
+	}
 	return keysOf(m)
 }
