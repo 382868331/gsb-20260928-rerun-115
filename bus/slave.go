@@ -3,32 +3,33 @@ package bus
 // Slave 是教学协议从设备：识别 7 位地址写，逐字节 ACK，采样 SDA 于
 // SCL 高电平中点。它从不驱动 SCL（时钟同步留给后续协议扩展）。
 type Slave struct {
-	id       string
-	addr     byte
-	selected bool
-	bitCnt   int
-	shifter  byte
-	// 每收到一个字节，在下一个位单元的前三个相位拉低 SDA 作为 ACK，
-	// 第四个相位释放，避免在 SCL 上升沿制造假 STOP。
-	ackStartTick int
-	ackAddrOK    bool
-	byteIndex    int
-	got          []byte
+	id         string
+	addr       byte
+	selected   bool
+	expectAddr bool
+	bitCnt     int
+	shifter    byte
+	// 每收到一个字节，在应答位单元拉低 SDA；下一位单元开始时释放。
+	ackStartTick  int
+	selectedAddr  bool
+	byteIndex     int
+	got           []byte
+	firstDataTick int
 }
 
 func NewSlave(id string, addr byte) *Slave {
-	return &Slave{id: id, addr: addr & 0x7f, ackStartTick: -100}
+	return &Slave{id: id, addr: addr & 0x7f, expectAddr: true, ackStartTick: -100, firstDataTick: -100}
 }
 
-func (s *Slave) ID() string       { return s.id }
-func (s *Slave) Bytes() []byte    { return s.got }
+func (s *Slave) ID() string    { return s.id }
+func (s *Slave) Bytes() []byte { return s.got }
 
 func (s *Slave) Drive(tick, phase int) Drive {
 	d := Release
-	if s.selected && s.ackAddrOK && tick >= s.ackStartTick {
-		// ACK 占据一个位单元的相位 0..2，相位 3 释放。
+	if s.selected && s.selectedAddr && tick >= s.ackStartTick {
+		// ACK 占据整个应答位单元，下一位单元开始时释放。
 		off := tick - s.ackStartTick
-		if off >= 0 && off <= 2 {
+		if off >= 0 && off <= 3 {
 			d.SDA = Low
 		}
 	}
@@ -40,20 +41,23 @@ func (s *Slave) Observe(snap Snapshot) {
 	case snap.StartCondition():
 		// START 与重复 START 都让从设备重新按地址匹配。
 		s.selected = true
+		s.expectAddr = true
 		s.bitCnt = 0
 		s.shifter = 0
 		s.byteIndex = 0
-		s.ackAddrOK = false
+		s.selectedAddr = false
 		s.ackStartTick = -100
+		s.firstDataTick = snap.Tick - snap.Phase + 4
 	case snap.StopCondition():
 		s.selected = false
-		s.ackAddrOK = false
+		s.selectedAddr = false
 		s.ackStartTick = -100
-	case s.selected && snap.SCLRising():
-		s.shifter <<= 1
+	case s.selected && snap.Tick >= s.firstDataTick && snap.SCL == High && snap.Phase == 1:
+		bit := byte(0)
 		if snap.SDA == High {
-			s.shifter |= 1
+			bit = 1
 		}
+		s.shifter = (s.shifter << 1) | bit
 		s.bitCnt++
 		if s.bitCnt == 8 {
 			s.handleByte(snap)
@@ -67,18 +71,13 @@ func (s *Slave) Observe(snap Snapshot) {
 func (s *Slave) handleByte(snap Snapshot) {
 	// ACK 位从下一个相位 0（即当前上升沿之后）开始。
 	s.ackStartTick = snap.Tick - snap.Phase + 4
-	isAddr := s.byteIndex == 0 || s.afterRStart
-	_ = isAddr
-	// 简化判定：地址字节的最低位是 R/W#；本协议地址出现在每次 START 后，
-	// 由 lastWasStart 标记（见下方字段）。
+	s.firstDataTick = s.ackStartTick + 4
 	if s.expectAddr {
-		addr := s.shifter >> 1
-		rw := s.shifter & 1
-		s.ackAddrOK = addr == s.addr && rw == 0
+		s.selectedAddr = s.shifter == (s.addr<<1)&0xfe
 		s.expectAddr = false
 		return
 	}
-	if s.ackAddrOK {
+	if s.selectedAddr {
 		s.got = append(s.got, s.shifter)
 	}
 }
@@ -88,7 +87,19 @@ func (s *Slave) OnEvent(kind, who, detail string) {
 		s.selected = false
 		s.bitCnt = 0
 		s.shifter = 0
-		s.ackAddrOK = false
+		s.selectedAddr = false
 		s.ackStartTick = -100
 	}
+}
+
+// Reset 供恢复设备或测试在两次 Tick 之间清除从设备状态。
+func (s *Slave) Reset() {
+	s.selected = false
+	s.expectAddr = true
+	s.bitCnt = 0
+	s.shifter = 0
+	s.byteIndex = 0
+	s.selectedAddr = false
+	s.ackStartTick = -100
+	s.firstDataTick = -100
 }

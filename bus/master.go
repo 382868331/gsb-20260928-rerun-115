@@ -18,15 +18,18 @@ type TxResult struct {
 // 四分之一时钟（SCL 的低/上升/高/下降相位）。输掉仲裁时立即丢弃编排、
 // 释放总线，绝不继续驱动。
 type Master struct {
-	id     string
-	b      *Bus
-	start  int
-	segs   []seg
-	active bool
-	lost   bool
-	done   bool
-	result TxResult
-	doneCh chan TxResult
+	id        string
+	b         *Bus
+	start     int
+	segs      []seg
+	active    bool
+	lost      bool
+	done      bool
+	result    TxResult
+	doneCh    chan TxResult
+	attempts  []TxResult
+	lostAt    int
+	busFreeAt int
 }
 
 type segKind int
@@ -34,8 +37,8 @@ type segKind int
 const (
 	segStart segKind = iota
 	segRStart
-	segBit  // SDA 在整个位单元保持 val
-	segAck  // 主设备释放 SDA，读从设备应答
+	segBit // SDA 在整个位单元保持 val
+	segAck // 主设备释放 SDA，读从设备应答
 	segStop
 )
 
@@ -46,15 +49,47 @@ type seg struct {
 }
 
 func NewMaster(id string, b *Bus, startTick int) *Master {
-	return &Master{id: id, b: b, start: startTick, doneCh: make(chan TxResult, 1)}
+	return &Master{id: id, b: b, start: startTick, doneCh: make(chan TxResult, 16), busFreeAt: -1}
 }
 
 func (m *Master) ID() string { return m.id }
 
 // Done 在事务结束（成功、NACK、仲裁失败均算结束）时可读。
-func (m *Master) Done() <-chan TxResult { return m.doneCh }
-func (m *Master) Result() TxResult      { return m.result }
-func (m *Master) Active() bool          { return m.active }
+func (m *Master) Done() <-chan TxResult  { return m.doneCh }
+func (m *Master) Result() TxResult       { return m.result }
+func (m *Master) Active() bool           { return m.active }
+func (m *Master) Lost() bool             { return m.lost }
+func (m *Master) LostAt() int            { return m.lostAt }
+func (m *Master) PendingFrames() []Frame { return append([]Frame(nil), m.result.Frames...) }
+func (m *Master) Attempts() []TxResult   { return append([]TxResult(nil), m.attempts...) }
+
+func (m *Master) ArbitratingAt(tick, phase int) bool {
+	if !m.active || m.lost || tick < m.start {
+		return false
+	}
+	idx := (tick - 1 - m.start) / 4
+	return idx >= 0 && idx < len(m.segs) && m.segs[idx].kind == segBit && phase == 1
+}
+
+func (m *Master) DataBitAt(tick, phase int) bool {
+	if !m.active || m.lost || tick < m.start {
+		return false
+	}
+	idx := (tick - 1 - m.start) / 4
+	return idx >= 0 && idx < len(m.segs) && m.segs[idx].kind == segBit
+}
+
+func (m *Master) ParticipatingAt(tick int) bool {
+	return m.active && !m.lost && tick >= m.start
+}
+
+// CanRetryAt 报告输掉仲裁的设备在指定时刻是否已等到一个完整空闲位周期。
+func (m *Master) CanRetryAt(tick int) bool {
+	return m.lost && m.busFreeAt >= 0 && tick >= m.busFreeAt
+}
+
+// EarliestRetry 返回输掉仲裁后允许重新发起 START 的最早相位 0。
+func (m *Master) EarliestRetry() int { return m.busFreeAt }
 
 // QueueWrite 编排一帧或多帧；多帧之间自动插入重复 START。
 func (m *Master) QueueWrite(frames ...Frame) {
@@ -84,27 +119,13 @@ func (m *Master) appendByte(v byte, label string) {
 	m.segs = append(m.segs, seg{kind: segAck, label: label + " ACK"})
 }
 
-// begin 由 Runner 在起始时刻调用。
-func (m *Master) begin() {
-	if len(m.segs) == 0 || m.active || m.done {
-		return
-	}
-	m.active = true
-	if m.start < m.b.Tick {
-		m.start = m.b.Tick
-	}
-	// 对齐到下一个相位 0。
-	if rem := m.start % 4; rem != 0 {
-		m.start += 4 - rem
-	}
-}
-
 func (m *Master) Drive(tick, phase int) Drive {
+	m.activate(tick)
 	if !m.active || m.lost || tick < m.start {
 		return Release
 	}
-	idx := (tick - m.start) / 4
-	if idx < 0 || idx >= len(m.segs) || idx >= len(m.segs) {
+	idx := (tick - 1 - m.start) / 4
+	if idx < 0 || idx >= len(m.segs) {
 		return Release
 	}
 	scl, sda := bitDrive(m.segs[idx], phase)
@@ -163,21 +184,26 @@ func bitDrive(s seg, phase int) (scl, sda Level) {
 }
 
 func (m *Master) Observe(s Snapshot) {
+	if s.StopCondition() {
+		boundary := s.Tick - s.Phase
+		m.busFreeAt = boundary + 4
+	}
+
 	if !m.active || m.lost || s.Tick < m.start {
 		return
 	}
-	idx := (s.Tick - s.Tick%4 - m.start) / 4
+	idx := (s.Tick - 1 - m.start) / 4
 	if idx < 0 || idx >= len(m.segs) {
 		return
 	}
-	seg := m.segs[idx]
+	current := m.segs[idx]
 
 	// 在应答位的高电平相位中点采样：低=ACK，高=NACK。
-	if seg.kind == segAck && s.Phase == 2 {
+	if current.kind == segAck && s.Phase == 1 {
 		if s.SDA == High {
 			// 从设备无响应：记录错误，后续字节与帧全部裁掉，仅保留 STOP，
 			// 从而正常结束而不是卡在等待。
-			m.result.Err = fmt.Errorf("%s: NACK at %s (no device responding)", m.id, seg.label)
+			m.result.Err = fmt.Errorf("%s: NACK at %s (no device responding)", m.id, current.label)
 			m.segs = append(m.segs[:idx+1], seg{kind: segStop, label: "P"})
 		}
 	}
@@ -194,32 +220,68 @@ func (m *Master) OnEvent(kind, who, detail string) {
 	}
 }
 
+func (m *Master) activate(tick int) {
+	if m.active || m.done || m.lost || len(m.segs) == 0 || tick < m.start {
+		return
+	}
+	if m.start < tick {
+		m.start = tick
+	}
+	if rem := m.start % 4; rem != 0 {
+		m.start += 4 - rem
+	}
+	if tick < m.start {
+		return
+	}
+	m.active = true
+}
+
 func (m *Master) lose() {
+	m.attempts = append(m.attempts, m.result)
 	m.lost = true
+	m.lostAt = m.b.Now
 	m.active = false
 	m.segs = nil
-	if m.result.Err == nil {
-		m.result.Err = fmt.Errorf("%s: lost arbitration", m.id)
-	}
+	m.result.Err = fmt.Errorf("%s: lost arbitration at tick %d; frames retained for retry", m.id, m.b.Now)
 	m.finish()
+}
+
+// Retry 在总线空闲后重新排队仲裁失败的事务。startTick 必须位于相位 0。
+func (m *Master) Retry(startTick int) bool {
+	if !m.lost || !m.CanRetryAt(startTick) || (startTick-1)%4 != 0 {
+		return false
+	}
+	frames := m.result.Frames
+	m.lost = false
+	m.done = false
+	m.active = false
+	m.start = startTick
+	m.result = TxResult{Frames: append([]Frame(nil), frames...)}
+	m.QueueWrite(frames...)
+	m.done = false
+	m.active = false
+	return true
 }
 
 // TickCommit 由 Runner 在每个总线时钟后调用，检查事务是否走完。
 func (m *Master) TickCommit(tick int) {
+	m.activate(tick)
 	if !m.active || m.done {
 		return
 	}
 	if tick >= m.start+len(m.segs)*4 {
 		m.active = false
+		m.attempts = append(m.attempts, m.result)
 		m.finish()
 	}
 }
 
 func (m *Master) abort(reason string) {
+	m.attempts = append(m.attempts, m.result)
 	m.active = false
 	m.segs = nil
-	if !m.done && m.result.Err == nil {
-		m.result.Err = fmt.Errorf("%s: aborted by %s", m.id, reason)
+	if !m.done {
+		m.result.Err = fmt.Errorf("%s: aborted by %s at tick %d", m.id, reason, m.b.Now)
 	}
 	m.finish()
 }
