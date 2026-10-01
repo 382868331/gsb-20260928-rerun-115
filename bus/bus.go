@@ -63,14 +63,19 @@ func (s Snapshot) StopCondition() bool { return s.PrevSCL == High && s.SCL == Hi
 
 // 事件种类。事件是协议无关的设备间通知机制。
 const (
-	EvStart        = "start"     // 观测到 START 条件
-	EvStop         = "stop"      // 观测到 STOP 条件，总线回到空闲
-	EvArbGrant     = "arb-grant" // 仲裁有了唯一胜者
-	EvArbLost      = "arb-lost"  // 某主设备输掉仲裁，必须立刻释放总线
-	EvReset        = "reset"     // 中途复位
-	EvRecoverBegin = "recovery-begin"
-	EvRecoverClock = "recovery-clock"
-	EvRecoverDone  = "recovery-done"
+	EvStart         = "start"     // 观测到 START 条件
+	EvStop          = "stop"      // 观测到 STOP 条件，总线回到空闲
+	EvArbGrant      = "arb-grant" // 仲裁有了唯一胜者
+	EvArbLost       = "arb-lost"  // 某主设备输掉仲裁，必须立刻释放总线
+	EvReset         = "reset"     // 中途复位
+	EvRecoverBegin  = "recovery-begin"
+	EvRecoverClock  = "recovery-clock"
+	EvRecoverDone   = "recovery-done"
+	EvRecoverGrant  = "recovery-grant"
+	EvRecoverLost   = "recovery-lost"
+	EvRecoverFailed = "recovery-failed"
+	EvClockWait     = "clock-wait"
+	EvClockTimeout  = "clock-timeout"
 )
 
 // Entry 是消息记录中的一条：要么记录一段电平，要么记录一个事件。
@@ -109,6 +114,19 @@ type Bus struct {
 
 	Trace   []Entry
 	pending []Entry
+}
+
+// Checkpoint 是两次 Tick 之间的完整总线状态，可在一个位单元中间保存并恢复。
+type Checkpoint struct {
+	Now         int
+	SCL         Level
+	SDA         Level
+	PrevSCL     Level
+	PrevSDA     Level
+	Trace       []Entry
+	Pending     []Entry
+	Devices     []Device
+	DeviceState map[string]interface{}
 }
 
 func New() *Bus {
@@ -212,6 +230,46 @@ func (b *Bus) applyPending() {
 
 // Idle 表示两根线都被释放（高电平）。
 func (b *Bus) Idle() bool { return b.scl == High && b.sda == High }
+
+// Checkpoint 保存当前电气、轨迹、待派发事件和设备状态。
+func (b *Bus) Checkpoint() Checkpoint {
+	cp := Checkpoint{
+		Now: b.Now, SCL: b.scl, SDA: b.sda, PrevSCL: b.prevSCL, PrevSDA: b.prevSDA,
+		Trace: append([]Entry(nil), b.Trace...), Pending: append([]Entry(nil), b.pending...),
+		Devices:     append([]Device(nil), b.devs...),
+		DeviceState: map[string]interface{}{},
+	}
+	for _, dev := range b.devs {
+		if saver, ok := dev.(StatefulDevice); ok {
+			cp.DeviceState[dev.ID()] = saver.SaveState()
+		}
+	}
+	return cp
+}
+
+// Restore 恢复 Checkpoint；设备注册集合必须与保存时相同。
+func (b *Bus) Restore(cp Checkpoint) {
+	b.Now = cp.Now
+	b.scl, b.sda = cp.SCL, cp.SDA
+	b.prevSCL, b.prevSDA = cp.PrevSCL, cp.PrevSDA
+	b.Trace = append([]Entry(nil), cp.Trace...)
+	b.pending = append([]Entry(nil), cp.Pending...)
+	b.devs = append([]Device(nil), cp.Devices...)
+	b.pendReg = nil
+	b.pendUn = nil
+	b.drives = map[string]Drive{}
+	for _, dev := range b.devs {
+		if restorer, ok := dev.(StatefulDevice); ok {
+			restorer.RestoreState(cp.DeviceState[dev.ID()])
+		}
+	}
+}
+
+// StatefulDevice 能在检查点边界保存和恢复全部内部状态。
+type StatefulDevice interface {
+	SaveState() interface{}
+	RestoreState(interface{})
+}
 
 func keysOf(m map[string]bool) []string {
 	out := make([]string, 0, len(m))

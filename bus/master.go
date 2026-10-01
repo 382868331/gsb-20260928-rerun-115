@@ -30,6 +30,10 @@ type Master struct {
 	attempts  []TxResult
 	lostAt    int
 	busFreeAt int
+	stall     int
+	waitSince int
+	timeout   int
+	blocked   bool
 }
 
 type segKind int
@@ -52,6 +56,14 @@ func NewMaster(id string, b *Bus, startTick int) *Master {
 	return &Master{id: id, b: b, start: startTick, doneCh: make(chan TxResult, 16), busFreeAt: -1}
 }
 
+// SetClockStretchTimeout 设置主设备等待 SCL 变为高电平的最大 tick 数；0 表
+// 示无限等待。超时只中止本次事务并留下事件，不会擅自宣布恢复成功。
+func (m *Master) SetClockStretchTimeout(ticks int) {
+	if ticks >= 0 {
+		m.timeout = ticks
+	}
+}
+
 func (m *Master) ID() string { return m.id }
 
 // Done 在事务结束（成功、NACK、仲裁失败均算结束）时可读。
@@ -60,27 +72,36 @@ func (m *Master) Result() TxResult       { return m.result }
 func (m *Master) Active() bool           { return m.active }
 func (m *Master) Lost() bool             { return m.lost }
 func (m *Master) LostAt() int            { return m.lostAt }
+func (m *Master) Blocked() bool          { return m.blocked }
 func (m *Master) PendingFrames() []Frame { return append([]Frame(nil), m.result.Frames...) }
 func (m *Master) Attempts() []TxResult   { return append([]TxResult(nil), m.attempts...) }
 
 func (m *Master) ArbitratingAt(tick, phase int) bool {
-	if !m.active || m.lost || tick < m.start {
-		return false
-	}
-	idx := (tick - 1 - m.start) / 4
-	return idx >= 0 && idx < len(m.segs) && m.segs[idx].kind == segBit && phase == 1
+	_, current, ok := m.segmentAt(tick)
+	return ok && current.kind == segBit && (m.logicalTick(tick)-1-m.start)%4 == 1
 }
 
 func (m *Master) DataBitAt(tick, phase int) bool {
-	if !m.active || m.lost || tick < m.start {
-		return false
+	_, current, ok := m.segmentAt(tick)
+	return ok && current.kind == segBit
+}
+
+func (m *Master) logicalTick(tick int) int { return tick - m.stall }
+
+func (m *Master) segmentAt(tick int) (int, seg, bool) {
+	logical := m.logicalTick(tick)
+	if !m.active || m.lost || logical <= m.start {
+		return 0, seg{}, false
 	}
-	idx := (tick - 1 - m.start) / 4
-	return idx >= 0 && idx < len(m.segs) && m.segs[idx].kind == segBit
+	idx := (logical - 1 - m.start) / 4
+	if idx < 0 || idx >= len(m.segs) {
+		return idx, seg{}, false
+	}
+	return idx, m.segs[idx], true
 }
 
 func (m *Master) ParticipatingAt(tick int) bool {
-	return m.active && !m.lost && tick >= m.start
+	return m.active && !m.lost && !m.blocked && tick > m.start+m.stall
 }
 
 // CanRetryAt 报告输掉仲裁的设备在指定时刻是否已等到一个完整空闲位周期。
@@ -121,14 +142,15 @@ func (m *Master) appendByte(v byte, label string) {
 
 func (m *Master) Drive(tick, phase int) Drive {
 	m.activate(tick)
-	if !m.active || m.lost || tick < m.start {
+	if !m.active || m.lost || m.blocked || tick <= m.start+m.stall {
 		return Release
 	}
-	idx := (tick - 1 - m.start) / 4
-	if idx < 0 || idx >= len(m.segs) {
+	_, current, ok := m.segmentAt(tick)
+	if !ok {
 		return Release
 	}
-	scl, sda := bitDrive(m.segs[idx], phase)
+	logicalPhase := (m.logicalTick(tick) - 1 - m.start) % 4
+	scl, sda := bitDrive(current, logicalPhase)
 	return Drive{SCL: scl, SDA: sda}
 }
 
@@ -189,17 +211,38 @@ func (m *Master) Observe(s Snapshot) {
 		m.busFreeAt = boundary + 4
 	}
 
-	if !m.active || m.lost || s.Tick < m.start {
+	if !m.active || m.lost || m.blocked || s.Tick <= m.start+m.stall {
 		return
 	}
-	idx := (s.Tick - 1 - m.start) / 4
-	if idx < 0 || idx >= len(m.segs) {
+	idx, current, ok := m.segmentAt(s.Tick)
+	if !ok {
 		return
 	}
-	current := m.segs[idx]
+	logicalPhase := (m.logicalTick(s.Tick) - 1 - m.start) % 4
+
+	// 主设备在相位 1 释放 SCL，真实线路必须由线与结果决定。若仍为低，本
+	// 逻辑相位不前进，直到从设备释放或超时。
+	wantsHighSCL := logicalPhase == 1 || (current.kind == segStart && logicalPhase < 3) ||
+		(current.kind == segRStart && logicalPhase >= 1 && logicalPhase < 3) ||
+		(current.kind == segStop && logicalPhase >= 1)
+	if wantsHighSCL && s.SCL == Low {
+		if m.waitSince == 0 {
+			m.waitSince = s.Tick
+			s.Bus.EnqueueEvent(EvClockWait, m.id, fmt.Sprintf("tick=%d segment=%s", s.Tick, current.label))
+		}
+		if m.timeout > 0 && s.Tick-m.waitSince+1 >= m.timeout {
+			s.Bus.EnqueueEvent(EvClockTimeout, m.id, fmt.Sprintf("tick=%d waited=%d", s.Tick, s.Tick-m.waitSince+1))
+			m.abort("clock stretch timeout")
+		}
+		m.stall++
+		return
+	}
+	if m.waitSince > 0 && s.SCL == High {
+		m.waitSince = 0
+	}
 
 	// 在应答位的高电平相位中点采样：低=ACK，高=NACK。
-	if current.kind == segAck && s.Phase == 1 {
+	if current.kind == segAck && logicalPhase == 1 && s.SCL == High {
 		if s.SDA == High {
 			// 从设备无响应：记录错误，后续字节与帧全部裁掉，仅保留 STOP，
 			// 从而正常结束而不是卡在等待。
@@ -217,6 +260,16 @@ func (m *Master) OnEvent(kind, who, detail string) {
 		}
 	case EvReset:
 		m.abort("reset")
+	case EvRecoverFailed:
+		m.blocked = true
+		m.attempts = append(m.attempts, m.result)
+		m.active = false
+		m.segs = nil
+		m.done = false
+		m.result.Err = fmt.Errorf("%s: aborted by failed bus recovery at tick %d", m.id, m.b.Now)
+		m.finish()
+	case EvRecoverDone:
+		m.blocked = false
 	}
 }
 
@@ -234,6 +287,49 @@ func (m *Master) activate(tick int) {
 		return
 	}
 	m.active = true
+}
+
+func (m *Master) SaveState() interface{} {
+	return masterState{
+		start: m.start, segs: append([]seg(nil), m.segs...), active: m.active, lost: m.lost,
+		done: m.done, result: m.result, attempts: append([]TxResult(nil), m.attempts...),
+		lostAt: m.lostAt, busFreeAt: m.busFreeAt, stall: m.stall, waitSince: m.waitSince,
+		timeout: m.timeout, blocked: m.blocked,
+	}
+}
+
+func (m *Master) RestoreState(value interface{}) {
+	state, _ := value.(masterState)
+	m.start = state.start
+	m.segs = append([]seg(nil), state.segs...)
+	m.active = state.active
+	m.lost = state.lost
+	m.done = state.done
+	m.result = state.result
+	m.result.Frames = append([]Frame(nil), state.result.Frames...)
+	m.attempts = append([]TxResult(nil), state.attempts...)
+	m.lostAt = state.lostAt
+	m.busFreeAt = state.busFreeAt
+	m.stall = state.stall
+	m.waitSince = state.waitSince
+	m.timeout = state.timeout
+	m.blocked = state.blocked
+}
+
+type masterState struct {
+	start     int
+	segs      []seg
+	active    bool
+	lost      bool
+	done      bool
+	result    TxResult
+	attempts  []TxResult
+	lostAt    int
+	busFreeAt int
+	stall     int
+	waitSince int
+	timeout   int
+	blocked   bool
 }
 
 func (m *Master) lose() {
@@ -269,7 +365,7 @@ func (m *Master) TickCommit(tick int) {
 	if !m.active || m.done {
 		return
 	}
-	if tick >= m.start+len(m.segs)*4 {
+	if tick >= m.start+m.stall+len(m.segs)*4 {
 		m.active = false
 		m.attempts = append(m.attempts, m.result)
 		m.finish()

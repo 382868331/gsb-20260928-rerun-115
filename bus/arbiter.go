@@ -15,6 +15,11 @@ type Arbiter struct {
 	granted  map[string]bool
 }
 
+type arbiterState struct {
+	active  map[string]bool
+	granted map[string]bool
+}
+
 func NewArbiter(id string, masters ...*Master) *Arbiter {
 	a := &Arbiter{id: id, masters: map[string]*Master{}, suppress: map[*Recovery]bool{}, active: map[string]bool{}, granted: map[string]bool{}}
 	for _, master := range masters {
@@ -63,10 +68,10 @@ func (a *Arbiter) Observe(s Snapshot) {
 			a.granted[id] = false
 			continue
 		}
-		if !participating[id] || !master.DataBitAt(s.Tick, s.Phase) || s.Phase != 1 {
+		if !participating[id] || !master.ArbitratingAt(s.Tick, s.Phase) || !s.SCLRising() {
 			continue
 		}
-		if a.active[id] && drive.SDA == High && s.SDA == Low {
+		if a.active[id] && drive.SDA == High && s.SDA == Low && a.anotherMasterDrivesSDA(id, s) {
 			a.active[id] = false
 			a.granted[id] = false
 			s.Bus.EnqueueEvent(EvArbLost, id, fmt.Sprintf("tick=%d phase=%d", s.Tick, s.Phase))
@@ -86,6 +91,17 @@ func (a *Arbiter) Observe(s Snapshot) {
 	}
 }
 
+func (a *Arbiter) anotherMasterDrivesSDA(id string, s Snapshot) bool {
+	for _, owner := range s.OwnersSDA {
+		if owner != id {
+			if _, ok := a.masters[owner]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *Arbiter) OnEvent(kind, who, detail string) {
 	switch kind {
 	case EvArbLost:
@@ -97,4 +113,22 @@ func (a *Arbiter) OnEvent(kind, who, detail string) {
 			a.granted[id] = false
 		}
 	}
+}
+
+func (a *Arbiter) SaveState() interface{} {
+	return arbiterState{active: copyBoolMap(a.active), granted: copyBoolMap(a.granted)}
+}
+
+func (a *Arbiter) RestoreState(value interface{}) {
+	state, _ := value.(arbiterState)
+	a.active = copyBoolMap(state.active)
+	a.granted = copyBoolMap(state.granted)
+}
+
+func copyBoolMap(in map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

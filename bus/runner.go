@@ -16,6 +16,11 @@ func NewRunner(b *Bus, devs ...Device) *Runner {
 		}
 		b.Register(dev)
 	}
+	for _, dev := range b.pendReg {
+		if group, ok := dev.(*RecoveryGroup); ok {
+			group.bind(b)
+		}
+	}
 	return r
 }
 
