@@ -71,6 +71,9 @@ const (
 	EvRecoverBegin = "recovery-begin"
 	EvRecoverClock = "recovery-clock"
 	EvRecoverDone  = "recovery-done"
+	// EvException 是更高优先级的异常处置请求；detail 为 "wait"（等待本组
+	// 完成后让出）或 "abort"（在当前操作边界中止本组）。
+	EvException = "exception"
 )
 
 // Entry 是消息记录中的一条：要么记录一段电平，要么记录一个事件。
@@ -106,6 +109,7 @@ type Bus struct {
 	drives           map[string]Drive
 	scl, sda         Level
 	prevSCL, prevSDA Level
+	busy             bool // START 之后、STOP 之前为占用状态
 
 	Trace   []Entry
 	pending []Entry
@@ -164,6 +168,15 @@ func (b *Bus) Tick() {
 		}
 	}
 
+	// START/STOP 条件更新占用状态：瞬时两线皆高（如数据位 1 的高电平
+	// 相位）不代表总线空闲。
+	if b.prevSCL == High && b.scl == High && b.prevSDA == High && b.sda == Low {
+		b.busy = true
+	}
+	if b.prevSCL == High && b.scl == High && b.prevSDA == Low && b.sda == High {
+		b.busy = false
+	}
+
 	snap := Snapshot{
 		Tick: b.Now, Phase: phase,
 		SCL: b.scl, SDA: b.sda,
@@ -212,6 +225,9 @@ func (b *Bus) applyPending() {
 
 // Idle 表示两根线都被释放（高电平）。
 func (b *Bus) Idle() bool { return b.scl == High && b.sda == High }
+
+// Busy 表示总线处于 START 与 STOP 之间的占用状态。
+func (b *Bus) Busy() bool { return b.busy }
 
 func keysOf(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
