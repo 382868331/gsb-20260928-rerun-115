@@ -40,6 +40,7 @@ const (
 	segBit // SDA 在整个位单元保持 val
 	segAck // 主设备释放 SDA，读从设备应答
 	segStop
+	segMAck // 读操作中由主设备驱动的应答位（val=Low 为 ACK，High 为 NACK）
 )
 
 type seg struct {

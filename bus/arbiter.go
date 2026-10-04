@@ -5,22 +5,47 @@ import (
 	"sort"
 )
 
+// Participant 是仲裁器关心的主设备行为接口；Master 与 GroupMaster 都实现它。
+type Participant interface {
+	ID() string
+	ParticipatingAt(tick int) bool
+	DataBitAt(tick, phase int) bool
+}
+
 // Arbiter 在每个快照上比较主设备“想发送的 SDA”和线与后的 SDA。
 // 输掉的主设备在该相位观察结束后立即停止驱动；START/STOP 不参与比较。
 type Arbiter struct {
 	id       string
-	masters  map[string]*Master
+	masters  map[string]Participant
 	suppress map[*Recovery]bool
 	active   map[string]bool
 	granted  map[string]bool
 }
 
 func NewArbiter(id string, masters ...*Master) *Arbiter {
-	a := &Arbiter{id: id, masters: map[string]*Master{}, suppress: map[*Recovery]bool{}, active: map[string]bool{}, granted: map[string]bool{}}
+	a := newArbiter(id)
 	for _, master := range masters {
 		a.masters[master.ID()] = master
 	}
 	return a
+}
+
+// NewArbiterOf 接受任意 Participant（例如 GroupMaster 或混合编组）。
+func NewArbiterOf(id string, parts ...Participant) *Arbiter {
+	a := newArbiter(id)
+	a.Watch(parts...)
+	return a
+}
+
+// Watch 把更多参与者纳入仲裁。
+func (a *Arbiter) Watch(parts ...Participant) {
+	for _, p := range parts {
+		a.masters[p.ID()] = p
+	}
+}
+
+func newArbiter(id string) *Arbiter {
+	return &Arbiter{id: id, masters: map[string]Participant{}, suppress: map[*Recovery]bool{}, active: map[string]bool{}, granted: map[string]bool{}}
 }
 
 func (a *Arbiter) SuppressRecovery(recoveries ...*Recovery) {
