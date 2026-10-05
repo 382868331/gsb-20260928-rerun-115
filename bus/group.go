@@ -311,8 +311,9 @@ func (g *GroupMaster) Observe(s Snapshot) {
 	cur := g.segs[idx]
 
 	// 从设备拉伸时钟：本相位 SCL 应升高却被拉低，整组时序顺延一拍，
-	// 状态翻转为“等待设备”，直到 SCL 被释放。
-	if ephase == 1 && s.SCL == Low && (cur.kind == segBit || cur.kind == segAck || cur.kind == segMAck) {
+	// 状态翻转为“等待设备”，直到 SCL 被释放。重复 START 与 STOP 位段
+	// 同样可能被拉伸，必须保持位位置，否则后续寻址与读写方向会错位。
+	if ephase == 1 && s.SCL == Low && cur.kind != segStart {
 		g.stretch++
 		g.waitingDevice = true
 		g.sawStretch = true

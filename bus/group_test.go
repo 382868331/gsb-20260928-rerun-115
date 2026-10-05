@@ -379,3 +379,75 @@ func TestGroupSaveResumeAtArbitraryBit(t *testing.T) {
 		t.Fatal("bus not idle at end")
 	}
 }
+
+// 从设备在重复 START 前拉伸时钟：位位置必须保持，重复 START 后的寻址与
+// 读写方向切换不能错位，读回字节必须与预置一致，且读地址/读数据不得
+// 混进从设备的写入记录。
+func TestGroupStretchBeforeRepeatedStartKeepsBitPosition(t *testing.T) {
+	b := New()
+	g := NewGroupMaster("g", b, 0)
+	g.QueueGroup(
+		Op{Addr: 0x50, Data: []byte{0x11, 0x22}},
+		Op{Addr: 0x50, Read: true, Len: 1},
+	)
+	slave := NewStretchSlave("s50", 0x50)
+	slave.SetReadData([]byte{0xA5})
+	slave.PauseAfterByte(1, 6)
+	r := NewRunner(b, g, slave, NewArbiterOf("arb", g))
+
+	waitingSeen := false
+	var result GroupResult
+	for i := 0; i < 700; i++ {
+		select {
+		case result = <-g.Done():
+			goto done
+		default:
+		}
+		if g.Status() == StatusWaitingDevice {
+			waitingSeen = true
+		}
+		r.Step()
+	}
+	t.Fatal("group did not finish")
+done:
+	if !waitingSeen || !g.SawStretch() {
+		t.Fatalf("stretch before repeated START not observed (waiting=%v saw=%v)", waitingSeen, g.SawStretch())
+	}
+	if result.Err != nil {
+		t.Fatalf("group error: %v", result.Err)
+	}
+	if !result.Ops[0].Done || result.Ops[0].Written != 2 {
+		t.Fatalf("op0 = %+v, want 2 written bytes done", result.Ops[0])
+	}
+	if !result.Ops[1].Done || len(result.Ops[1].Read) != 1 || result.Ops[1].Read[0] != 0xA5 {
+		t.Fatalf("op1 read = % x, want [A5]", result.Ops[1].Read)
+	}
+	if got := slave.Bytes(); len(got) != 2 || got[0] != 0x11 || got[1] != 0x22 {
+		t.Fatalf("slave got % x, want [11 22] (no read address/data mixed in)", got)
+	}
+	if !b.Idle() {
+		t.Fatal("bus not idle after group")
+	}
+}
+
+// 从设备在最后一字节的 ACK 之后拉伸时钟（下一段是 STOP）：主设备同样
+// 必须顺延，STOP 之后总线空闲且结果完整。
+func TestGroupStretchBeforeStop(t *testing.T) {
+	b := New()
+	g := NewGroupMaster("g", b, 0)
+	g.QueueGroup(Op{Addr: 0x40, Data: []byte{0x5A}})
+	slave := NewStretchSlave("s40", 0x40)
+	slave.PauseAfterByte(0, 5)
+	r := NewRunner(b, g, slave, NewArbiterOf("arb", g))
+
+	result := waitGroupDone(t, g.Done(), 400, r)
+	if result.Err != nil || !result.Ops[0].Done || result.Ops[0].Written != 1 {
+		t.Fatalf("result = %+v, want 1 byte written after stretched STOP", result)
+	}
+	if got := slave.Bytes(); len(got) != 1 || got[0] != 0x5A {
+		t.Fatalf("slave got % x, want [5A]", got)
+	}
+	if !b.Idle() {
+		t.Fatal("bus not idle after stretched STOP")
+	}
+}
