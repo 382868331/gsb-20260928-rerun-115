@@ -122,6 +122,56 @@ done:
 	}
 }
 
+// 写两字节后经重复 START 读预置字节；从设备在第二字节 ACK 后拉伸时钟，
+// 拉伸正好落在重复 START 位段上。主设备必须保持位位置顺延，读回与预置
+// 一致，且读地址/读数据不得混入从设备的写入记录。
+func TestGroupWriteThenReadAcrossStretchedRepeatedStart(t *testing.T) {
+	b := New()
+	g := NewGroupMaster("g", b, 0)
+	g.QueueGroup(
+		Op{Addr: 0x50, Data: []byte{0x01, 0x02}},
+		Op{Addr: 0x50, Read: true, Len: 1},
+	)
+	slave := NewStretchSlave("s50", 0x50)
+	slave.SetReadData([]byte{0xA5})
+	slave.PauseAfterByte(1, 6)
+	r := NewRunner(b, g, slave, NewArbiterOf("arb", g))
+
+	waitingSeen := false
+	var result GroupResult
+	for i := 0; i < 400; i++ {
+		select {
+		case result = <-g.Done():
+			goto done
+		default:
+		}
+		if g.Status() == StatusWaitingDevice {
+			waitingSeen = true
+		}
+		r.Step()
+	}
+	t.Fatal("group did not finish")
+done:
+	if !waitingSeen || !g.SawStretch() {
+		t.Fatalf("stretch not observed (waiting=%v saw=%v)", waitingSeen, g.SawStretch())
+	}
+	if result.Err != nil {
+		t.Fatalf("group error: %v", result.Err)
+	}
+	if !result.Ops[0].Done || result.Ops[0].Written != 2 {
+		t.Fatalf("op0 = %+v, want 2 written bytes done", result.Ops[0])
+	}
+	if !result.Ops[1].Done || len(result.Ops[1].Read) != 1 || result.Ops[1].Read[0] != 0xA5 {
+		t.Fatalf("op1 read = %x, want [A5]", result.Ops[1].Read)
+	}
+	if got := slave.Bytes(); len(got) != 2 || got[0] != 0x01 || got[1] != 0x02 {
+		t.Fatalf("slave got %x, want [01 02] (read address/data must not leak into writes)", got)
+	}
+	if !b.Idle() {
+		t.Fatal("bus not idle after group")
+	}
+}
+
 // 从设备最终退出（停止应答）：整组以 STOP 结束，已完成操作的结果不被抹掉。
 func TestGroupSlaveQuitKeepsPartialResults(t *testing.T) {
 	b := New()
